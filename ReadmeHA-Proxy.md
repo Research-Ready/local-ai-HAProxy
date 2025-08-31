@@ -59,3 +59,21 @@ backend bk_supabase
 
 backend bk_supabase_api
   server s1 127.0.0.1:8000 check
+
+
+openwebui.ha.valuechainhackers.xyz
+8080
+n8n.ha.valuechainhackers.xyz
+5678
+flowise.ha.valuechainhackers.xyz
+3001
+langfuse.ha.valuechainhackers.xyz
+3000
+searxng.ha.valuechainhackers.xyz
+8080
+qdrant.ha.valuechainhackers.xyz
+6333
+neo4j.ha.valuechainhackers.xyz
+7474
+supabase-kong.ha.valuechainhackers.xyz
+8000
