@@ -2,7 +2,7 @@
 | -------------------- | --------------------------------------- | ------------------------------------- |
 | Open WebUI           | `openwebui.ha.valuechainhackers.xyz`    | 8080                                  |
 | n8n                  | `n8n.ha.valuechainhackers.xyz`          | 5678                                  |
-| Flowise              | `flowise.ha.valuechainhackers.xyz`      | 3000 (or 3001 if mapped)              |
+| Flowise              | `flowise.ha.valuechainhackers.xyz`      | 3001              |
 | Langfuse             | `langfuse.ha.valuechainhackers.xyz`     | 3000                                  |
 | SearXNG              | `search.ha.valuechainhackers.xyz`       | 8080                                  |
 | Qdrant (UI/API)      | `qdrant.ha.valuechainhackers.xyz`       | 6333                                  |
