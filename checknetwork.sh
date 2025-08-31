@@ -1,124 +1,161 @@
+```bash
 #!/usr/bin/env bash
-# ai_stack_health.sh — quick diagnostics for local-ai-packaged services behind HAProxy
-# Checks localhost ports + basic HTTP responses. Accepts 2xx/3xx as healthy.
-# Usage: ./ai_stack_health.sh [--host 127.0.0.1] [--timeout 4] [--retries 20] [--sleep 2]
+# ai_stack_diag.sh — robust internal health diagnostics for local-ai-packaged
+# - No prompts, no assumptions; checks keep going even if some tools/ports fail
+# - Uses curl for HTTP; falls back to nc or /dev/tcp for raw TCP when needed
+# - Configure via env vars (no flags needed):
+#     HOST=127.0.0.1 RETRIES=20 SLEEP=2 CONNECT_TIMEOUT=3 HTTP_TIMEOUT=5 ./ai_stack_diag.sh
 
-set -euo pipefail
+# ---------- Config (env-overridable) ----------
+HOST="${HOST:-127.0.0.1}"
+RETRIES="${RETRIES:-20}"              # how many times to retry a service before giving up
+SLEEP="${SLEEP:-2}"                   # seconds between retries
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-3}"  # TCP/HTTP connect timeout per try
+HTTP_TIMEOUT="${HTTP_TIMEOUT:-5}"        # total HTTP time per try
 
-HOST="127.0.0.1"
-TIMEOUT=4
-RETRIES=20
-SLEEP=2
+# ---------- Tool detection ----------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+HAS_CURL=0; has_cmd curl && HAS_CURL=1
+HAS_NC=0;   has_cmd nc && HAS_NC=1
+HAS_TIMEOUT=0; has_cmd timeout && HAS_TIMEOUT=1
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --host)    HOST="${2:-127.0.0.1}"; shift 2 ;;
-    --timeout) TIMEOUT="${2:-4}"; shift 2 ;;
-    --retries) RETRIES="${2:-20}"; shift 2 ;;
-    --sleep)   SLEEP="${2:-2}"; shift 2 ;;
-    -h|--help)
-      echo "Usage: $0 [--host IP] [--timeout SEC] [--retries N] [--sleep SEC]"
-      exit 0
-      ;;
-    *) echo "Unknown arg: $1"; exit 2 ;;
-  esac
-done
+# ---------- Output helpers (no color to avoid weird shells) ----------
+ok()   { printf "OK     - %s\n" "$*"; }
+warn() { printf "WARN   - %s\n" "$*"; }
+fail() { printf "FAIL   - %s\n" "$*"; }
+info() { printf "INFO   - %s\n" "$*"; }
+line() { printf -- "-----------------------------------------------\n"; }
 
-# Colors if TTY
-if [[ -t 1 ]]; then
-  GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; CYAN="\033[36m"; BOLD="\033[1m"; RESET="\033[0m"
-else
-  GREEN=""; YELLOW=""; RED=""; CYAN=""; BOLD=""; RESET=""
-fi
-
-ok()   { echo -e "${GREEN}✔${RESET} $*"; }
-warn() { echo -e "${YELLOW}⚠${RESET} $*"; }
-err()  { echo -e "${RED}✘${RESET} $*"; }
-info() { echo -e "${CYAN}i${RESET} $*"; }
-
-# Service map: name|port|path-to-ping
-readarray -t SERVICES <<'EOF'
-OpenWebUI|8080|/
-n8n|5678|/rest/ping
-Flowise|3001|/
-Langfuse|3010|/
-SearXNG|8081|/
-Qdrant|6333|/collections
-Neo4j|7474|/
-EOF
-
-tcp_check() {
-  local host="$1" port="$2"
-  (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1
+# ---------- TCP check with fallbacks ----------
+tcp_check_once() {
+  # $1 host, $2 port
+  local h="$1" p="$2"
+  # Prefer nc if present
+  if [ "$HAS_NC" -eq 1 ]; then
+    nc -z -w "$CONNECT_TIMEOUT" "$h" "$p" >/dev/null 2>&1
+    return $?
+  fi
+  # Try /dev/tcp with timeout if available
+  if [ "$HAS_TIMEOUT" -eq 1 ]; then
+    timeout "$CONNECT_TIMEOUT" bash -c ">/dev/tcp/$h/$p" >/dev/null 2>&1
+    return $?
+  fi
+  # Last resort: try HTTP connect (may fail for non-HTTP ports, but better than nothing)
+  if [ "$HAS_CURL" -eq 1 ]; then
+    curl -sS -o /dev/null --connect-timeout "$CONNECT_TIMEOUT" "http://$h:$p/" >/dev/null 2>&1
+    return $?
+  fi
+  # No method available
+  return 2
 }
 
-http_status() {
-  local url="$1" timeout="$2"
-  curl -sS -o /dev/null -m "$timeout" -w "%{http_code}" "$url" || echo "000"
-}
-
-wait_for_tcp() {
-  local name="$1" host="$2" port="$3" retries="$4" sleep_s="$5"
-  for i in $(seq 1 "$retries"); do
-    if tcp_check "$host" "$port"; then
+tcp_check_retry() {
+  # $1 host, $2 port, $3 name
+  local h="$1" p="$2" name="$3" i=1
+  while [ "$i" -le "$RETRIES" ]; do
+    if tcp_check_once "$h" "$p"; then
       return 0
     fi
-    sleep "$sleep_s"
+    sleep "$SLEEP"
+    i=$((i+1))
   done
   return 1
 }
 
-divider() { printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '─'; }
-
-echo -e "${BOLD}AI Stack Internal Diagnostics${RESET} (host: ${BOLD}${HOST}${RESET}, timeout: ${TIMEOUT}s)"
-divider
-
-declare -i FAILS=0
-declare -a REPORT=()
-
-for line in "${SERVICES[@]}"; do
-  IFS='|' read -r NAME PORT PATH <<<"$line"
-  URL="http://${HOST}:${PORT}${PATH}"
-  printf "%-10s → %s " "$NAME" "$URL"
-
-  if ! wait_for_tcp "$NAME" "$HOST" "$PORT" "$RETRIES" "$SLEEP"; then
-    err "TCP closed on ${HOST}:${PORT}"
-    REPORT+=("$(printf '%-10s : %s' "$NAME" "DOWN (TCP closed)")")
-    ((FAILS++))
-    continue
+# ---------- HTTP check (2xx/3xx considered healthy) ----------
+http_check_once() {
+  # $1 url
+  local url="$1" code="000"
+  if [ "$HAS_CURL" -ne 1 ]; then
+    echo "$code"
+    return 0
   fi
+  code=$(curl -sS -o /dev/null -m "$HTTP_TIMEOUT" --connect-timeout "$CONNECT_TIMEOUT" -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+  echo "$code"
+}
 
-  STATUS=$(http_status "$URL" "$TIMEOUT")
-  if [[ "$STATUS" =~ ^2..$ || "$STATUS" =~ ^3..$ ]]; then
-    ok "HTTP ${STATUS}"
-    REPORT+=("$(printf '%-10s : %s' "$NAME" "OK (HTTP ${STATUS})")")
-  else
-    warn "HTTP ${STATUS}"
-    REPORT+=("$(printf '%-10s : %s' "$NAME" "WARN (HTTP ${STATUS})")")
-    # Special-case deeper checks
-    case "$NAME" in
-      Qdrant)
-        # try health-ish endpoint
-        HEALTH=$(http_status "http://${HOST}:${PORT}/readyz" "$TIMEOUT")
-        [[ "$HEALTH" =~ ^2..$ ]] && ok "Qdrant /readyz ${HEALTH}" || true
-        ;;
-      n8n)
-        # /rest/ping is already used; nothing extra
-        ;;
+http_check_retry() {
+  # $1 url
+  local url="$1" i=1 code
+  while [ "$i" -le "$RETRIES" ]; do
+    code=$(http_check_once "$url")
+    case "$code" in
+      2??|3??) echo "$code"; return 0 ;;
+      *) sleep "$SLEEP" ;;
     esac
+    i=$((i+1))
+  done
+  echo "$code"
+  return 1
+}
+
+# ---------- Service list: name|port|path|check_mode ----------
+# check_mode: http or tcp
+read -r -d '' SERVICES <<'EOF'
+OpenWebUI|8080|/|http
+n8n|5678|/rest/ping|http
+Flowise|3001|/|http
+Langfuse|3010|/|http
+SearXNG|8081|/|http
+Qdrant|6333|/collections|http
+Neo4j|7474|/|http
+Neo4jBolt|7687|/|tcp
+EOF
+
+# ---------- Run ----------
+printf "AI Stack Internal Diagnostics (host: %s, retries: %s, sleep: %ss, timeouts: connect=%ss http=%ss)\n" "$HOST" "$RETRIES" "$SLEEP" "$CONNECT_TIMEOUT" "$HTTP_TIMEOUT"
+line
+[ "$HAS_CURL" -eq 1 ] && info "curl detected" || warn "curl NOT found (HTTP checks may be limited)"
+[ "$HAS_NC" -eq 1 ]   && info "nc detected"   || warn "nc NOT found (raw TCP checks use fallbacks)"
+[ "$HAS_TIMEOUT" -eq 1 ] && info "timeout detected" || warn "timeout NOT found (raw TCP fallbacks may block longer)"
+line
+
+FAILS=0
+WARNS=0
+
+# Iterate services
+# Use while-read to avoid seq; robust even in BusyBox environments
+IFS='
+'
+for entry in $SERVICES; do
+  name=$(printf "%s" "$entry" | awk -F'|' '{print $1}')
+  port=$(printf "%s" "$entry" | awk -F'|' '{print $2}')
+  path=$(printf "%s" "$entry" | awk -F'|' '{print $3}')
+  mode=$(printf "%s" "$entry" | awk -F'|' '{print $4}')
+
+  url="http://${HOST}:${port}${path}"
+  printf "%-10s -> %s\n" "$name" "$url"
+
+  if [ "$mode" = "http" ]; then
+    # First ensure TCP opens (fast fail if impossible)
+    if tcp_check_retry "$HOST" "$port" "$name"; then
+      code=$(http_check_retry "$url")
+      if printf "%s" "$code" | grep -Eq '^(2|3)[0-9][0-9]$'; then
+        ok "$name HTTP $code"
+      else
+        warn "$name HTTP $code"
+        WARNS=$((WARNS+1))
+      fi
+    else
+      fail "$name TCP CLOSED on ${HOST}:${port}"
+      FAILS=$((FAILS+1))
+    fi
+  else
+    # Pure TCP checks (e.g., Neo4j Bolt)
+    if tcp_check_retry "$HOST" "$port" "$name"; then
+      ok "$name TCP OPEN on ${HOST}:${port}"
+    else
+      fail "$name TCP CLOSED on ${HOST}:${port}"
+      FAILS=$((FAILS+1))
+    fi
   fi
+  line
 done
 
-divider
-echo -e "${BOLD}Summary:${RESET}"
-for r in "${REPORT[@]}"; do echo " • $r"; done
-
-if (( FAILS > 0 )); then
-  echo
-  err "Failures: ${FAILS}"
+# ---------- Summary ----------
+printf "Summary: FAIL=%d  WARN=%d\n" "$FAILS" "$WARNS"
+if [ "$FAILS" -gt 0 ]; then
   exit 1
-else
-  echo
-  ok "All services reachable (2xx/3xx considered healthy)."
-  exit 0
 fi
+exit 0
+```
