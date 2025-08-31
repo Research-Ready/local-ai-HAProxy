@@ -1,0 +1,187 @@
+version: "3.9"
+
+name: ai-packaged
+services:
+  # ---------- Core UI ----------
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    restart: unless-stopped
+    environment:
+      WEBUI_PORT: "8080"
+      OLLAMA_API_BASE_URL: http://ollama:11434
+      LOCALAI_BASE_URL: http://localai:8080
+      QDRANT_URL: http://qdrant:6333
+      LANGFUSE_HOST: http://langfuse-web:3000
+      N8N_URL: http://n8n:5678
+      OPENAI_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_BASE_URL: https://openrouter.ai
+    volumes:
+      - openwebui_data:/app/backend/data
+    ports:
+      - "8080:8080"            # expose (HAProxy -> 127.0.0.1:8080)
+    depends_on:
+      - pipelines
+      - ollama
+      - localai
+      - qdrant
+    networks: [stack_net]
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    container_name: openwebui-pipelines
+    restart: unless-stopped
+    environment:
+      PIPELINES_API_KEY: ${PIPELINES_API_KEY:-0p3n-w3bu!}
+    expose:
+      - "9099"                 # internal only
+    networks: [stack_net]
+
+  # ---------- Model backends (internal) ----------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    expose:
+      - "11434"                # internal only
+    networks: [stack_net]
+
+  localai:
+    image: quay.io/go-skynet/local-ai:latest
+    container_name: localai
+    restart: unless-stopped
+    environment:
+      MODELS_PATH: /models
+    volumes:
+      - localai_models:/models
+    expose:
+      - "8080"                 # internal only
+    networks: [stack_net]
+
+  # ---------- Vector DB ----------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"            # expose (UI/API)
+    networks: [stack_net]
+
+  # ---------- n8n ----------
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    environment:
+      N8N_HOST: n8n.ha.valuechainhackers.xyz
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://n8n.ha.valuechainhackers.xyz/
+    volumes:
+      - n8n_data:/home/node/.n8n
+    ports:
+      - "5678:5678"            # expose
+    networks: [stack_net]
+
+  # ---------- Flowise ----------
+  flowise:
+    image: flowiseai/flowise:latest
+    container_name: flowise
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      FLOWISE_USERNAME: ${FLOWISE_USER:-admin}
+      FLOWISE_PASSWORD: ${FLOWISE_PASS:-admin}
+    volumes:
+      - flowise_data:/root/.flowise
+    ports:
+      - "3001:3000"            # expose (host 3001 -> container 3000)
+    networks: [stack_net]
+
+  # ---------- Langfuse (web + db) ----------
+  langfuse-db:
+    image: postgres:15
+    container_name: langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_db:/var/lib/postgresql/data
+    expose:
+      - "5432"                 # internal only
+    networks: [stack_net]
+
+  langfuse-web:
+    image: ghcr.io/langfuse/langfuse:latest
+    container_name: langfuse-web
+    restart: unless-stopped
+    depends_on:
+      - langfuse-db
+    environment:
+      DATABASE_URL: postgres://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse}@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-changeme}
+      NEXTAUTH_URL: https://langfuse.ha.valuechainhackers.xyz
+    ports:
+      - "3010:3000"            # expose (avoid 3000 conflicts)
+    networks: [stack_net]
+
+  # ---------- SearXNG ----------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: https://search.ha.valuechainhackers.xyz/
+    ports:
+      - "8081:8080"            # expose (avoid 8080 conflict with OpenWebUI)
+    networks: [stack_net]
+
+  # ---------- Neo4j ----------
+  neo4j:
+    image: neo4j:5
+    container_name: neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-changeme}
+      NEO4J_server_memory_pagecache_size: 1G
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 2G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "7474:7474"            # Browser UI
+      - "7687:7687"            # Bolt (Browser login & drivers)
+    networks: [stack_net]
+
+  # ---------- (Optional) Supabase ----------
+  # Supabase is a full suite; include only if you need it now.
+  # supabase-gateway:
+  #   image: supabase/gotrue:latest  # placeholder; prefer official docker compose from Supabase
+  #   ...
+  #   ports:
+  #     - "8000:8000"          # expose API Gateway
+  # supabase-studio:
+  #   image: supabase/studio:latest
+  #   ports:
+  #     - "3020:3000"          # expose Studio UI (host 3020)
+
+networks:
+  stack_net:
+    driver: bridge
+
+volumes:
+  openwebui_data:
+  ollama_data:
+  localai_models:
+  qdrant_data:
+  n8n_data:
+  flowise_data:
+  langfuse_db:
+  neo4j_data:
+  neo4j_logs:
